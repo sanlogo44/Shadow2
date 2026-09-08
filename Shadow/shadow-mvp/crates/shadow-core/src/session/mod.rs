@@ -108,6 +108,93 @@ impl<'a> SessionStore<'a> {
         Ok(id)
     }
 
+    /// Löscht eine Session inkl. aller Nachrichten (harte Löschung).
+    /// Der Aufrufer ist für die Berechtigungsprüfung verantwortlich.
+    pub fn delete_session(&self, session_id: &str) -> Result<(), ShadowError> {
+        let tx = self.conn.unchecked_transaction()?;
+        tx.execute("DELETE FROM message WHERE session_id = ?1", [session_id])?;
+        tx.execute("DELETE FROM session WHERE id = ?1", [session_id])?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Fasst zwei Sessions zu einer neuen zusammen. Die Nachrichten werden
+    /// zeitlich sortiert übernommen (content_enc bleibt gültig, da derselbe
+    /// Master-Key). Die Quell-Sessions werden archiviert, nicht gelöscht.
+    pub fn merge_sessions(
+        &self,
+        user_id: &str,
+        chat1: &str,
+        chat2: &str,
+        new_title: &str,
+    ) -> Result<String, ShadowError> {
+        if chat1 == chat2 {
+            return Err(ShadowError::Forbidden(
+                "kann Session nicht mit sich selbst mergen".into(),
+            ));
+        }
+        let m1 = self.get_session(chat1)?.ok_or_else(|| ShadowError::NotFound(chat1.into()))?;
+        let m2 = self.get_session(chat2)?.ok_or_else(|| ShadowError::NotFound(chat2.into()))?;
+        if m1.user_id != user_id || m2.user_id != user_id {
+            return Err(ShadowError::Forbidden(
+                "merge nur für eigene Sessions erlaubt".into(),
+            ));
+        }
+        let new_id = self.create_session(user_id, &m1.model_id, new_title)?;
+        let now = now_unix();
+
+        // Nachrichten beider Sessions zeitlich sortiert in die neue kopieren.
+        // content_enc kann direkt übernommen werden (gleicher Master-Key),
+        // bekommt aber neue IDs und das neue session_id.
+        let mut stmt = self.conn.prepare(
+            "SELECT role, content_enc, content_plain, token_count_in, token_count_out,
+                    latency_ms, finish_reason, created_at
+             FROM message WHERE session_id IN (?1, ?2) ORDER BY created_at")?;
+        let rows = stmt.query_map([chat1, chat2], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, Vec<u8>>(1)?,
+                r.get::<_, i64>(2)?,
+                r.get::<_, i64>(3)?,
+                r.get::<_, i64>(4)?,
+                r.get::<_, i64>(5)?,
+                r.get::<_, Option<String>>(6)?,
+                r.get::<_, i64>(7)?,
+            ))
+        })?;
+        let copied: Vec<_> = rows.collect::<Result<_, _>>()?;
+        drop(stmt);
+
+        let tx = self.conn.unchecked_transaction()?;
+        for (role, content_enc, plain, tin, tout, latency, finish, created) in copied {
+            tx.execute(
+                "INSERT INTO message
+                    (id, session_id, role, content_enc, content_plain,
+                     token_count_in, token_count_out, latency_ms,
+                     finish_reason, created_at)
+                 VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10)",
+                rusqlite::params![
+                    uuid::Uuid::new_v4().to_string(), new_id, role, content_enc,
+                    plain, tin, tout, latency, finish, created,
+                ],
+            )?;
+        }
+        tx.execute(
+            "UPDATE session SET archived = 1, updated_at = ?3 WHERE id IN (?1, ?2)",
+            rusqlite::params![chat1, chat2, now],
+        )?;
+        tx.commit()?;
+        Ok(new_id)
+    }
+
+    pub fn rename_session(&self, session_id: &str, title: &str) -> Result<(), ShadowError> {
+        self.conn.execute(
+            "UPDATE session SET title = ?2, updated_at = ?3 WHERE id = ?1",
+            rusqlite::params![session_id, title, now_unix()],
+        )?;
+        Ok(())
+    }
+
     pub fn get_session(&self, session_id: &str) -> Result<Option<SessionMeta>, ShadowError> {
         let row = self.conn.query_row(
             "SELECT id, user_id, title, model_id, created_at, updated_at

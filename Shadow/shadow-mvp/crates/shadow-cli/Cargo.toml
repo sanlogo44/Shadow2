@@ -5,4 +5,5 @@ edition = "2021"
 
 [dependencies]
 serde_json = { workspace = true }
+rpassword = { workspace = true }
 shadow-core = { path = "../shadow-core" }

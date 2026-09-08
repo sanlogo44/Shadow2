@@ -1,12 +1,18 @@
--- Shadow Platform MVP – Schema v1
+-- Shadow Platform MVP – Schema v2
 -- Alle Klartext-Payloads gehören verschlüsselt; Metadaten bleiben lesbar.
+-- v2: User-Accounts mit password_hash (Argon2id-PHC), email,
+--     must_change_password (First-Login) und kill_switch_hash.
 
 CREATE TABLE IF NOT EXISTS user (
     id            TEXT PRIMARY KEY,
     name          TEXT NOT NULL,
     role          TEXT NOT NULL CHECK (role IN ('admin','user')),
     created_at    INTEGER NOT NULL,          -- Unix-Sekunden
-    settings_json TEXT NOT NULL DEFAULT '{}'
+    settings_json TEXT NOT NULL DEFAULT '{}',
+    password_hash TEXT,                      -- Argon2id-PHC; NULL = kein Login
+    email         TEXT,
+    must_change_password INTEGER NOT NULL DEFAULT 0,
+    kill_switch_hash TEXT                    -- SHA-256 der Notfall-Phrase (optional)
 );
 
 CREATE TABLE IF NOT EXISTS session (
@@ -51,7 +57,7 @@ CREATE TABLE IF NOT EXISTS audit_event (
     id          TEXT PRIMARY KEY,
     timestamp   INTEGER NOT NULL,
     actor       TEXT NOT NULL,              -- user_id oder 'system'
-    action      TEXT NOT NULL,              -- z.B. 'model.switch','export','config.change'
+    action      TEXT NOT NULL,              -- z.B. 'auth.login','export','config.change'
     target      TEXT NOT NULL DEFAULT '',
     detail_json TEXT NOT NULL DEFAULT '{}'
 );
@@ -69,4 +75,4 @@ CREATE TABLE IF NOT EXISTS key_material (
 CREATE TABLE IF NOT EXISTS schema_meta (
     version INTEGER NOT NULL
 );
-INSERT OR IGNORE INTO schema_meta (version) VALUES (1);
+INSERT OR IGNORE INTO schema_meta (version) VALUES (2);

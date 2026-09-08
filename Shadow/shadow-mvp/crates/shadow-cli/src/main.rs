@@ -1,6 +1,24 @@
 //! Shadow CLI – MVP-Skeleton.
 //! Baut bewusst KEINE Modell-Logik; alles läuft über shadow_core.
+//!
+//! Befehle:
+//!   init                          Store + Keystore + Default-Modelle einrichten
+//!   login | logout                User-Session verwalten (First-Login-Flow)
+//!   users                         User auflisten / anlegen / löschen
+//!   models                        aktivierte Modelle anzeigen
+//!   doctor                        Integritäts-Check (DB, Keystore, Modell-Hashes)
+//!   sessions                      eigene Sessions auflisten
+//!   export <session_id>           Session exportieren (mit Exportkontrolle)
+//!   chat [model_id]               neuer Chat (interaktive Modellauswahl ohne Arg)
+//!   chat resume <session_id>      Chat-Verlauf fortsetzen
+//!   chat delete <session_id>      Chat löschen
+//!   chat merge <s1> <s2> [titel]  Chats zusammenführen
+//!   admin users|models|audit      Admin-Bereich
 
+mod shell;
+
+use shadow_core::auth::{AuthOutcome, UserStore};
+use shadow_core::bench::run_benchmark;
 use shadow_core::crypto::MasterKey;
 use shadow_core::model::{
     GenConstraints, GenParams, GenerateRequest, MessageInput, ModelAdapter, ModelConfig,
@@ -27,16 +45,24 @@ fn main() {
 
     match args.get(1).map(String::as_str) {
         Some("init") => cmd_init(&conn),
+        Some("login") => cmd_login(&conn, &data_dir),
+        Some("logout") => cmd_logout(&data_dir),
+        Some("users") => cmd_users(&conn, &args),
         Some("models") => cmd_models(&conn),
         Some("doctor") => cmd_doctor(&db_path),
-        Some("chat") => cmd_chat(&conn, args.get(2).map(String::as_str).unwrap_or("stub")),
-        Some("sessions") => cmd_sessions(&conn),
+        Some("sessions") => cmd_sessions(&conn, &data_dir),
         Some("export") => match args.get(2) {
-            Some(sid) => cmd_export(&conn, sid, export_path(&data_dir, sid)),
+            Some(sid) => cmd_export(&conn, &data_dir, sid, export_path(&data_dir, sid)),
             None => { eprintln!("Usage: export <session_id>"); std::process::exit(2); }
         },
+        Some("chat") => cmd_chat_dispatch(&conn, &data_dir, &args),
+        Some("admin") => cmd_admin(&conn, &args),
+        Some("bench") => cmd_bench(&conn, &data_dir, &args),
+        Some("shell") => shell::run(&conn, &data_dir),
         _ => {
-            eprintln!("Befehle: init | models | doctor | sessions | export <session_id> | chat [model_id]");
+            eprintln!("Befehle: init | login | logout | users | models | doctor | sessions | export <session_id>");
+            eprintln!("          chat [model_id] | chat resume|delete|merge ... | admin users|models|audit");
+            eprintln!("          bench [model_id] [runs] | shell");
             std::process::exit(2);
         }
     }
@@ -70,6 +96,41 @@ fn export_path(data_dir: &std::path::Path, session_id: &str) -> PathBuf {
     data_dir.join(format!("export-{session_id}.json"))
 }
 
+// ── User-Session (Login-State, MVP: Datei im data_dir) ─────────
+
+fn current_user_file(data_dir: &std::path::Path) -> PathBuf {
+    data_dir.join(".current_user")
+}
+
+fn current_user_id(data_dir: &std::path::Path) -> String {
+    std::fs::read_to_string(current_user_file(data_dir))
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| {
+            eprintln!("WARN: nicht eingeloggt — nutze Legacy-User 'local-admin'.");
+            "local-admin".into()
+        })
+}
+
+fn prompt(line: &str) -> String {
+    print!("{line}: ");
+    std::io::stdout().flush().unwrap();
+    let mut s = String::new();
+    std::io::stdin().read_line(&mut s).unwrap();
+    s.trim().to_string()
+}
+
+fn prompt_optional(line: &str) -> Option<String> {
+    let s = prompt(line);
+    if s.is_empty() { None } else { Some(s) }
+}
+
+fn prompt_password(line: &str) -> String {
+    rpassword::prompt_password(format!("{line}: ")).unwrap_or_else(|_| prompt(line))
+}
+
+// ── init / login / logout / users ──────────────────────────────
+
 fn cmd_init(conn: &rusqlite::Connection) {
     conn.execute(
         "INSERT OR IGNORE INTO user (id, name, role, created_at)
@@ -89,6 +150,108 @@ fn cmd_init(conn: &rusqlite::Connection) {
     println!("OK: Store + Keystore initialisiert ({} aktive Modelle)",
              reg.list_enabled().unwrap().len());
 }
+
+fn cmd_login(conn: &rusqlite::Connection, data_dir: &std::path::Path) {
+    let us = UserStore::new(conn);
+
+    if us.is_first_start().expect("first_start check") {
+        // ── First-Login: Default-Admin → neuer Admin ──
+        println!("First-Login: Default-Account aktivieren (Admin/1234).");
+        us.bootstrap_default_admin().expect("bootstrap default admin");
+        let pw = prompt_password("Passwort [Admin]");
+        if !us.verify_default_admin(&pw).expect("verify default") {
+            eprintln!("Login fehlgeschlagen.");
+            std::process::exit(1);
+        }
+        println!("\nNeuer Admin-Account (der Default-Admin wird danach gelöscht):");
+        let username = prompt("Username");
+        let new_pw = prompt_password("Passwort");
+        let email = prompt_optional("E-Mail (optional)");
+        let kill_switch = prompt_optional("Kill-Switch-Phrase (optional)");
+        match us.create_admin_replace_default(&username, &new_pw, email.as_deref(), kill_switch.as_deref()) {
+            Ok(admin) => {
+                std::fs::write(current_user_file(data_dir), &admin.id).expect("session schreiben");
+                println!("Willkommen, {}! First-Login abgeschlossen.", admin.name);
+            }
+            Err(e) => {
+                eprintln!("Fehler: {e}");
+                std::process::exit(1);
+            }
+        }
+        return;
+    }
+
+    // ── Normaler Login ──
+    let username = prompt("Username");
+    let password = prompt_password("Passwort");
+    match us.verify_account(&username, &password).expect("verify") {
+        AuthOutcome::Ok(user) => {
+            std::fs::write(current_user_file(data_dir), &user.id).expect("session schreiben");
+            println!("Angemeldet als {} ({}).", user.name, user.role);
+        }
+        AuthOutcome::MustChangePassword(user) => {
+            println!("Passwort-Change erforderlich ({}).", user.name);
+            let new_pw = prompt_password("Neues Passwort");
+            us.set_password(&user.id, &user.id, &new_pw).expect("set_password");
+            std::fs::write(current_user_file(data_dir), &user.id).expect("session schreiben");
+            println!("Passwort geändert. Angemeldet als {}.", user.name);
+        }
+        AuthOutcome::InvalidCredentials => {
+            eprintln!("Login fehlgeschlagen.");
+            std::process::exit(1);
+        }
+        AuthOutcome::KillSwitchTriggered => {
+            eprintln!("Kill-Switch ausgelöst — Account-Daten wurden gelöscht.");
+            std::process::exit(1);
+        }
+    }
+}
+
+fn cmd_logout(data_dir: &std::path::Path) {
+    let _ = std::fs::remove_file(current_user_file(data_dir));
+    println!("Abgemeldet.");
+}
+
+/// users                     → Liste
+/// users create <name> <role> [email]
+/// users delete <id>
+fn cmd_users(conn: &rusqlite::Connection, args: &[String]) {
+    let us = UserStore::new(conn);
+    match args.get(2).map(String::as_str) {
+        Some("create") => {
+            let name = args.get(3).cloned().unwrap_or_else(|| prompt("Username"));
+            let role = args.get(4).cloned().unwrap_or_else(|| "user".into());
+            let email = args.get(5).cloned();
+            let pw = prompt_password("Passwort");
+            match us.create_user(&current_user_placeholder(), &name, &pw, &role, email.as_deref()) {
+                Ok(u) => println!("User {} angelegt ({}).", u.name, u.id),
+                Err(e) => { eprintln!("Fehler: {e}"); std::process::exit(1); }
+            }
+        }
+        Some("delete") => {
+            let id = match args.get(3) {
+                Some(i) => i.clone(),
+                None => { eprintln!("Usage: users delete <id>"); std::process::exit(2); }
+            };
+            us.delete_user("cli", &id).expect("delete user");
+            println!("User {id} gelöscht.");
+        }
+        _ => {
+            println!("{:<38}  {:<10}  {:<6}  E-Mail", "ID", "Name", "Rolle");
+            for u in us.list_users().expect("list users") {
+                println!("{:<38}  {:<10}  {:<6}  {}",
+                         u.id, u.name, u.role, u.email.unwrap_or_default());
+            }
+        }
+    }
+}
+
+/// MVP: `users create` ohne vorherigen Login — Actor-Platzhalter.
+fn current_user_placeholder() -> String {
+    "cli".into()
+}
+
+// ── models / doctor ────────────────────────────────────────────
 
 fn cmd_models(conn: &rusqlite::Connection) {
     let reg = ModelRegistry::new(conn);
@@ -125,7 +288,18 @@ fn cmd_doctor(db_path: &std::path::Path) {
         Err(e) => { println!("FAIL Keystore: {e}"); problems += 1; }
     }
 
-    // 3) Modell-Datei-Hashes (Tamper Detection)
+    // 3) Mindestens ein admin-fähiger Account mit Passwort?
+    let admins: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM user WHERE role = 'admin' AND password_hash IS NOT NULL",
+        [], |r| r.get(0)).unwrap_or(0);
+    if admins == 0 {
+        println!("WARN Kein Admin mit Passwort — `shadow login` startet First-Login.");
+        problems += 1;
+    } else {
+        println!("OK   Admin-Account vorhanden ({admins})");
+    }
+
+    // 4) Modell-Datei-Hashes (Tamper Detection)
     let reg = ModelRegistry::new(&conn);
     for m in reg.list_enabled().expect("models") {
         if let Some((path, expected)) = configured_model_file(&m) {
@@ -148,15 +322,18 @@ fn cmd_doctor(db_path: &std::path::Path) {
     }
 
     if problems > 0 {
-        println!("\n{problems} Problem(e) — siehe FAIL/Zeilen oben.");
+        println!("\n{problems} Problem(e) — siehe FAIL/WARN-Zeilen oben.");
         std::process::exit(1);
     }
     println!("\nAlles in Ordnung.");
 }
 
-fn cmd_sessions(conn: &rusqlite::Connection) {
+// ── sessions / export ──────────────────────────────────────────
+
+fn cmd_sessions(conn: &rusqlite::Connection, data_dir: &std::path::Path) {
+    let user_id = current_user_id(data_dir);
     let store = SessionStore::new(conn);
-    for s in store.list_sessions("local-admin").expect("sessions") {
+    for s in store.list_sessions(&user_id).expect("sessions") {
         println!("{}  {}  model={}  updated={}",
                  s.id, s.title, s.model_id, s.updated_at);
     }
@@ -164,12 +341,19 @@ fn cmd_sessions(conn: &rusqlite::Connection) {
 
 /// Exportiert eine Session als JSON. Exportkontrolle: nur wenn das
 /// Session-Modell export_allowed=true hat. Jeder Export wird auditiert.
-fn cmd_export(conn: &rusqlite::Connection, session_id: &str, out: PathBuf) {
+fn cmd_export(conn: &rusqlite::Connection, data_dir: &std::path::Path, session_id: &str, out: PathBuf) {
+    let user_id = current_user_id(data_dir);
     let store = SessionStore::new(conn);
     let session = match store.get_session(session_id).expect("session") {
         Some(s) => s,
         None => { eprintln!("Session {session_id} nicht gefunden."); std::process::exit(1); }
     };
+    if session.user_id != user_id {
+        audit(conn, &user_id, "export.denied", session_id,
+              serde_json::json!({"reason": "not_owner"})).expect("audit");
+        eprintln!("Export VERWEIGERT: Session gehört nicht zum aktuellen User.");
+        std::process::exit(1);
+    }
 
     let reg = ModelRegistry::new(conn);
     let entry = reg.get(&session.model_id).expect("registry")
@@ -177,8 +361,7 @@ fn cmd_export(conn: &rusqlite::Connection, session_id: &str, out: PathBuf) {
 
     let detail = serde_json::json!({"session": session_id, "model": session.model_id});
     if !entry.export_allowed {
-        audit(conn, "local-admin", "export.denied", session_id, detail)
-            .expect("audit");
+        audit(conn, &user_id, "export.denied", session_id, detail).expect("audit");
         eprintln!("Export VERWEIGERT: Modell '{}' ist nicht exportierbar (export_allowed=false).",
                   session.model_id);
         std::process::exit(1);
@@ -196,7 +379,7 @@ fn cmd_export(conn: &rusqlite::Connection, session_id: &str, out: PathBuf) {
     std::fs::write(&out, serde_json::to_string_pretty(&export).unwrap())
         .expect("write export");
 
-    audit(conn, "local-admin", "export", session_id,
+    audit(conn, &user_id, "export", session_id,
           serde_json::json!({"file": out.to_string_lossy(), "bytes":
               std::fs::metadata(&out).map(|m| m.len()).unwrap_or(0)}))
         .expect("audit");
@@ -204,16 +387,85 @@ fn cmd_export(conn: &rusqlite::Connection, session_id: &str, out: PathBuf) {
              out.display(), sha256_bytes(&std::fs::read(&out).unwrap()));
 }
 
-fn cmd_chat(conn: &rusqlite::Connection, model_id: &str) {
-    let reg = ModelRegistry::new(conn);
-    let entry = match reg.get(model_id).expect("registry") {
-        Some(e) if e.enabled => e,
-        _ => {
-            eprintln!("Modell '{model_id}' nicht aktiviert. `shadow init` ausführen?");
-            std::process::exit(1);
-        }
-    };
+// ── chat ───────────────────────────────────────────────────────
 
+fn cmd_chat_dispatch(conn: &rusqlite::Connection, data_dir: &std::path::Path, args: &[String]) {
+    match args.get(2).map(String::as_str) {
+        Some("resume") => match args.get(3) {
+            Some(sid) => cmd_chat(conn, data_dir, None, Some(sid.as_str())),
+            None => { eprintln!("Usage: chat resume <session_id>"); std::process::exit(2); }
+        },
+        Some("delete") => match args.get(3) {
+            Some(sid) => cmd_chat_delete(conn, data_dir, sid),
+            None => { eprintln!("Usage: chat delete <session_id>"); std::process::exit(2); }
+        },
+        Some("merge") => {
+            let (s1, s2) = match (args.get(3), args.get(4)) {
+                (Some(a), Some(b)) => (a.clone(), b.clone()),
+                _ => { eprintln!("Usage: chat merge <s1> <s2> [titel]"); std::process::exit(2); }
+            };
+            let title = args.get(5).cloned().unwrap_or_else(|| "Zusammengeführt".into());
+            cmd_chat_merge(conn, data_dir, &s1, &s2, &title);
+        }
+        // chat <model_id> oder chat (interaktive Auswahl)
+        Some(model_id) => cmd_chat(conn, data_dir, Some(model_id), None),
+        None => cmd_chat(conn, data_dir, None, None),
+    }
+}
+
+fn cmd_chat_delete(conn: &rusqlite::Connection, data_dir: &std::path::Path, sid: &str) {
+    let user_id = current_user_id(data_dir);
+    let store = SessionStore::new(conn);
+    match store.get_session(sid).expect("get session") {
+        Some(s) if s.user_id == user_id => {}
+        _ => { eprintln!("Session nicht gefunden oder nicht deine."); std::process::exit(1); }
+    }
+    store.delete_session(sid).expect("delete session");
+    audit(conn, &user_id, "session.delete", sid, serde_json::json!({})).expect("audit");
+    println!("Session {sid} gelöscht.");
+}
+
+fn cmd_chat_merge(conn: &rusqlite::Connection, data_dir: &std::path::Path, s1: &str, s2: &str, title: &str) {
+    let user_id = current_user_id(data_dir);
+    let store = SessionStore::new(conn);
+    match store.merge_sessions(&user_id, s1, s2, title) {
+        Ok(new_id) => {
+            audit(conn, &user_id, "session.merge", &new_id,
+                  serde_json::json!({"from": [s1, s2]})).expect("audit");
+            println!("Sessions zusammengeführt → {new_id} (Quellen archiviert).");
+        }
+        Err(e) => { eprintln!("Merge fehlgeschlagen: {e}"); std::process::exit(1); }
+    }
+}
+
+/// Interaktive Modellauswahl, wenn kein model_id übergeben wurde.
+fn select_model_interactive(conn: &rusqlite::Connection) -> String {
+    let reg = ModelRegistry::new(conn);
+    let models = reg.list_enabled().expect("list models");
+    if models.is_empty() {
+        eprintln!("Keine aktivierten Modelle — `shadow init` ausführen.");
+        std::process::exit(1);
+    }
+    println!("Verfügbare Modelle:");
+    for (i, m) in models.iter().enumerate() {
+        println!("  [{}] {}  ({})", i + 1, m.model_id, m.display_name);
+    }
+    let sel = prompt("Nummer oder Modell-ID");
+    if let Ok(n) = sel.parse::<usize>() {
+        if (1..=models.len()).contains(&n) {
+            return models[n - 1].model_id.clone();
+        }
+    }
+    if models.iter().any(|m| m.model_id == sel) {
+        sel
+    } else {
+        eprintln!("Ungültige Auswahl: {sel}");
+        std::process::exit(2);
+    }
+}
+
+/// Baut UND lädt einen Adapter für einen Registry-Eintrag.
+pub(crate) fn build_adapter(entry: &ModelEntry) -> Box<dyn ModelAdapter> {
     let mut adapter: Box<dyn ModelAdapter> = match entry.adapter_type.as_str() {
         "stub" => Box::new(StubAdapter::new()),
         "python-echo" => {
@@ -240,16 +492,89 @@ fn cmd_chat(conn: &rusqlite::Connection, model_id: &str) {
         adapter_config: entry.capabilities_json.clone(),
         expected_sha256: None,
     }).expect("adapter load");
+    adapter
+}
+
+/// bench [model_id] [runs] — Latenz/Durchsatz eines Modells messen.
+fn cmd_bench(conn: &rusqlite::Connection, data_dir: &std::path::Path, args: &[String]) {
+    let user_id = current_user_id(data_dir);
+    let model_id = match args.get(2) {
+        Some(m) => m.clone(),
+        None => select_model_interactive(conn),
+    };
+    let runs: usize = args.get(3).and_then(|s| s.parse().ok()).unwrap_or(3);
+
+    let reg = ModelRegistry::new(conn);
+    let entry = match reg.get(&model_id).expect("registry") {
+        Some(e) if e.enabled => e,
+        _ => { eprintln!("Modell '{model_id}' nicht aktiviert."); std::process::exit(1); }
+    };
+
+    let mut adapter = build_adapter(&entry);
+    match run_benchmark(&mut *adapter, &entry.model_id, runs) {
+        Ok(res) => {
+            println!("{}", serde_json::to_string_pretty(&res).unwrap());
+            audit(conn, &user_id, "admin.benchmark", &res.model_id,
+                  serde_json::to_value(&res).unwrap()).expect("audit");
+        }
+        Err(e) => { eprintln!("Benchmark fehlgeschlagen: {e}"); std::process::exit(1); }
+    }
+}
+
+fn cmd_chat(
+    conn: &rusqlite::Connection,
+    data_dir: &std::path::Path,
+    model_id: Option<&str>,
+    resume_session: Option<&str>,
+) {
+    let user_id = current_user_id(data_dir);
+    let reg = ModelRegistry::new(conn);
+
+    // Fortsetzen: Modell aus der Session übernehmen.
+    let (model_id, session_id) = if let Some(sid) = resume_session {
+        let store = SessionStore::new(conn);
+        let meta = match store.get_session(sid).expect("get session") {
+            Some(m) if m.user_id == user_id => m,
+            _ => { eprintln!("Session nicht gefunden oder nicht deine."); std::process::exit(1); }
+        };
+        (meta.model_id, sid.to_string())
+    } else {
+        let mid = match model_id {
+            Some(m) => m.to_string(),
+            None => select_model_interactive(conn),
+        };
+        let store = SessionStore::new(conn);
+        let sid = store.create_session(&user_id, &mid, "CLI-Chat").expect("create session");
+        (mid, sid)
+    };
+
+    let entry = match reg.get(&model_id).expect("registry") {
+        Some(e) if e.enabled => e,
+        _ => {
+            eprintln!("Modell '{model_id}' nicht aktiviert. `shadow init` ausführen?");
+            std::process::exit(1);
+        }
+    };
+
+    let mut adapter = build_adapter(&entry);
 
     let key = open_keystore(conn);
     let sessions = SessionStore::new(conn);
-    let sid = sessions
-        .create_session("local-admin", model_id, "CLI-Chat")
-        .expect("create session");
-    println!("Session {sid} — leere Eingabe beendet (/exit).");
+
+    // Beim Fortsetzen: Chat-Verlauf laden.
+    let mut history: Vec<MessageInput> = Vec::new();
+    if resume_session.is_some() {
+        for m in sessions.messages(&key, &session_id).expect("history") {
+            history.push(MessageInput { role: m.role, content: m.content });
+        }
+        println!("Session {session_id} fortgesetzt ({} Nachrichten).", history.len());
+    } else {
+        println!("Session {session_id} — leere Eingabe beendet (/exit).");
+    }
+    audit(conn, &user_id, "session.open", &session_id,
+          serde_json::json!({"model": model_id})).expect("audit");
 
     let stdin = std::io::stdin();
-    let mut history: Vec<MessageInput> = Vec::new();
     loop {
         print!("> ");
         std::io::stdout().flush().unwrap();
@@ -258,12 +583,12 @@ fn cmd_chat(conn: &rusqlite::Connection, model_id: &str) {
         let input = line.trim();
         if input.is_empty() || input == "/exit" { break; }
 
-        sessions.append_message(&key, &sid, "user", input, None)
+        sessions.append_message(&key, &session_id, "user", input, None)
             .expect("persist user msg");
         history.push(MessageInput { role: "user".into(), content: input.into() });
 
         let req = GenerateRequest {
-            session_id: sid.clone(),
+            session_id: session_id.clone(),
             messages: history.clone(),
             params: GenParams::default(),
             constraints: GenConstraints::default(),
@@ -281,9 +606,49 @@ fn cmd_chat(conn: &rusqlite::Connection, model_id: &str) {
         })).expect("stream");
 
         sessions.append_message(
-            &key, &sid, "assistant", &reply,
+            &key, &session_id, "assistant", &reply,
             Some(&format!("{:?}", res.finish_reason)),
         ).expect("persist assistant msg");
         history.push(MessageInput { role: "assistant".into(), content: reply });
+    }
+}
+
+// ── admin ──────────────────────────────────────────────────────
+
+fn cmd_admin(conn: &rusqlite::Connection, args: &[String]) {
+    match args.get(2).map(String::as_str) {
+        Some("users") => {
+            println!("{:<38}  {:<10}  {:<6}", "ID", "Name", "Rolle");
+            for u in UserStore::new(conn).list_users().expect("users") {
+                println!("{:<38}  {:<10}  {:<6}", u.id, u.name, u.role);
+            }
+        }
+        Some("models") => {
+            let reg = ModelRegistry::new(conn);
+            println!("{:<14}  {:<12}  {:<7}  {}", "Modell", "Adapter", "enabled", "export");
+            // list() gibt alle Einträge; falls nicht vorhanden, Fallback auf list_enabled.
+            for m in reg.list_enabled().expect("models") {
+                println!("{:<14}  {:<12}  {:<7}  {}",
+                         m.model_id, m.adapter_type, m.enabled, m.export_allowed);
+            }
+        }
+        Some("audit") => {
+            let limit: i64 = args.get(3).and_then(|s| s.parse().ok()).unwrap_or(20);
+            let mut stmt = conn.prepare(
+                "SELECT timestamp, actor, action, target FROM audit_event
+                 ORDER BY timestamp DESC LIMIT ?1").unwrap();
+            let rows = stmt.query_map([limit], |r| {
+                Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?,
+                    r.get::<_, String>(2)?, r.get::<_, String>(3)?))
+            }).unwrap();
+            for r in rows {
+                let (ts, actor, action, target) = r.unwrap();
+                println!("{ts}  {actor:<12}  {action:<28}  {target}");
+            }
+        }
+        _ => {
+            eprintln!("Usage: admin users | admin models | admin audit [n]");
+            std::process::exit(2);
+        }
     }
 }
